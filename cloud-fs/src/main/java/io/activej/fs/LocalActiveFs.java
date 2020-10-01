@@ -18,8 +18,10 @@ package io.activej.fs;
 
 import io.activej.async.service.EventloopService;
 import io.activej.bytebuf.ByteBuf;
+import io.activej.common.ApplicationSettings;
 import io.activej.common.CollectorsEx;
 import io.activej.common.MemSize;
+import io.activej.common.collection.CollectionUtils;
 import io.activej.common.exception.UncheckedException;
 import io.activej.common.time.CurrentTimeProvider;
 import io.activej.common.tuple.Tuple2;
@@ -83,6 +85,8 @@ public final class LocalActiveFs implements ActiveFs, EventloopService, Eventloo
 	private static final Logger logger = LoggerFactory.getLogger(LocalActiveFs.class);
 
 	public static final String DEFAULT_TEMP_DIR = ".upload";
+	public static final boolean DEFAULT_SYNCED = ApplicationSettings.getBoolean(LocalActiveFs.class, "synced", false);
+	public static final boolean DEFAULT_SYNCED_APPEND = ApplicationSettings.getBoolean(LocalActiveFs.class, "syncedAppend", false);
 
 	private static final char SEPARATOR_CHAR = SEPARATOR.charAt(0);
 	private static final Function<String, String> toLocalName = File.separatorChar == SEPARATOR_CHAR ?
@@ -97,9 +101,13 @@ public final class LocalActiveFs implements ActiveFs, EventloopService, Eventloo
 	private final Path storage;
 	private final Executor executor;
 
+	private final Set<OpenOption> appendOptions = CollectionUtils.set(WRITE);
+	private final Set<OpenOption> appendNewOptions = CollectionUtils.set(WRITE, CREATE);
+
 	private MemSize readerBufferSize = MemSize.kilobytes(256);
 	private boolean hardlinkOnCopy = false;
 	private Path tempDir;
+	private boolean synced = DEFAULT_SYNCED;
 
 	CurrentTimeProvider now;
 
@@ -129,6 +137,11 @@ public final class LocalActiveFs implements ActiveFs, EventloopService, Eventloo
 		this.tempDir = storage.resolve(DEFAULT_TEMP_DIR);
 
 		now = eventloop;
+
+		if (DEFAULT_SYNCED_APPEND) {
+			appendOptions.add(SYNC);
+			appendNewOptions.add(SYNC);
+		}
 	}
 
 	public static LocalActiveFs create(Eventloop eventloop, Executor executor, Path storageDir) {
@@ -159,6 +172,32 @@ public final class LocalActiveFs implements ActiveFs, EventloopService, Eventloo
 		this.tempDir = tempDir;
 		return this;
 	}
+
+	/**
+	 * If set to {@code true}, all newly created files (via move, copy, upload) will be synchronously persisted to the storage device.
+	 * <p>
+	 * <b>Note: may be slow when there are a lot of new files created</b>
+	 */
+	public LocalActiveFs withSynced(boolean synced) {
+		this.synced = synced;
+		return this;
+	}
+
+	/**
+	 * If set to {@code true}, each write to {@link #append)} consumer will be synchronously written to the storage device.
+	 * <p>
+	 * <b>Note: significantly slows down appends</b>
+	 */
+	public LocalActiveFs withSyncedAppend(boolean syncedAppend) {
+		if (syncedAppend) {
+			appendOptions.add(SYNC);
+			appendNewOptions.add(SYNC);
+		} else {
+			appendOptions.remove(SYNC);
+			appendNewOptions.remove(SYNC);
+		}
+		return this;
+	}
 	// endregion
 
 	@Override
@@ -181,9 +220,12 @@ public final class LocalActiveFs implements ActiveFs, EventloopService, Eventloo
 					Path path = resolve(name);
 					FileChannel channel;
 					if (offset == 0) {
-						channel = ensureTarget(null, path, () -> FileChannel.open(path, CREATE, WRITE));
+						channel = ensureTarget(null, path, () -> FileChannel.open(path, appendNewOptions));
+						if (synced) {
+							fsync(path.getParent());
+						}
 					} else {
-						channel = FileChannel.open(path, WRITE);
+						channel = FileChannel.open(path, appendOptions);
 					}
 					if (channel.size() < offset) {
 						throw new IllegalOffsetException(LocalActiveFs.class);
@@ -192,12 +234,18 @@ public final class LocalActiveFs implements ActiveFs, EventloopService, Eventloo
 				})
 				.thenEx(translateScalarErrors(name))
 				.whenComplete(appendBeginPromise.recordStats())
-				.map(channel -> ChannelFileWriter.create(executor, channel)
-						.withOffset(offset)
-						.withAcknowledgement(ack -> ack
-								.thenEx(translateScalarErrors(name))
-								.whenComplete(appendFinishPromise.recordStats())
-								.whenComplete(toLogger(logger, TRACE, "onAppendComplete", name, offset, this))))
+				.map(channel -> {
+					ChannelFileWriter writer = ChannelFileWriter.create(executor, channel)
+							.withOffset(offset);
+					if (synced) {
+						writer.withForceOnClose(true);
+					}
+					return writer
+							.withAcknowledgement(ack -> ack
+									.thenEx(translateScalarErrors(name))
+									.whenComplete(appendFinishPromise.recordStats())
+									.whenComplete(toLogger(logger, TRACE, "onAppendComplete", name, offset, this)));
+				})
 				.whenComplete(toLogger(logger, TRACE, "append", name, offset, this));
 	}
 
@@ -342,9 +390,9 @@ public final class LocalActiveFs implements ActiveFs, EventloopService, Eventloo
 	@Override
 	public Promise<Void> start() {
 		return execute(() -> {
-			Files.createDirectories(tempDir);
+			createDirectories(tempDir);
 			if (!tempDir.startsWith(storage)) {
-				Files.createDirectories(storage);
+				createDirectories(storage);
 			}
 		});
 	}
@@ -409,68 +457,106 @@ public final class LocalActiveFs implements ActiveFs, EventloopService, Eventloo
 					Path tempPath = Files.createTempFile(tempDir, "", "");
 					return new Tuple2<>(tempPath, FileChannel.open(tempPath, CREATE, WRITE));
 				})
-				.map(pathAndChannel -> ChannelFileWriter.create(executor, pathAndChannel.getValue2())
-						.transformWith(transformer)
-						.withAcknowledgement(ack -> ack
-								.then(() -> execute(() -> doMove(pathAndChannel.getValue1(), resolve(name))))
-								.thenEx(translateScalarErrors(name))
-								.whenException(() -> execute(() -> Files.deleteIfExists(pathAndChannel.getValue1())))
-								.whenComplete(uploadFinishPromise.recordStats())
-								.whenComplete(toLogger(logger, TRACE, "onUploadComplete", name, this))))
+				.map(pathAndChannel -> {
+					ChannelFileWriter writer = ChannelFileWriter.create(executor, pathAndChannel.getValue2());
+					if (synced) {
+						writer.withForceOnClose(true);
+					}
+					return writer
+							.transformWith(transformer)
+							.withAcknowledgement(ack -> ack
+									.then(() -> execute(() -> {
+										Path target = resolve(name);
+										doMove(pathAndChannel.getValue1(), target);
+										if (synced) {
+											fsync(target.getParent());
+										}
+									}))
+									.thenEx(translateScalarErrors(name))
+									.whenException(() -> execute(() -> Files.deleteIfExists(pathAndChannel.getValue1())))
+									.whenComplete(uploadFinishPromise.recordStats())
+									.whenComplete(toLogger(logger, TRACE, "onUploadComplete", name, this)));
+				})
 				.thenEx(translateScalarErrors(name))
 				.whenComplete(uploadBeginPromise.recordStats());
 	}
 
-	private void doCopy(Map<String, String> sourceToTargetMap) throws FsBatchException, FsIOException {
-		for (Map.Entry<String, String> entry : sourceToTargetMap.entrySet()) {
-			String from = entry.getKey();
-			String to = entry.getValue();
-			translateBatchErrors(from, to, () -> {
-				Path path = resolve(from);
-				if (!Files.isRegularFile(path)) {
-					throw new FileNotFoundException(LocalActiveFs.class, "File '" + from + "' not found");
-				}
-				Path targetPath = resolve(to);
+	private void doCopy(Map<String, String> sourceToTargetMap) throws FsBatchException, FsIOException, IOException {
+		Set<Path> toFSync = new HashSet<>();
+		try {
+			for (Map.Entry<String, String> entry : sourceToTargetMap.entrySet()) {
+				String from = entry.getKey();
+				String to = entry.getValue();
+				translateBatchErrors(from, to, () -> {
+					Path path = resolve(from);
+					if (!Files.isRegularFile(path)) {
+						throw new FileNotFoundException(LocalActiveFs.class, "File '" + from + "' not found");
+					}
+					Path targetPath = resolve(to);
 
-				if (path.equals(targetPath)) {
-					touch(path);
-					return;
-				}
+					if (path.equals(targetPath)) {
+						touch(path);
+						if (synced) {
+							toFSync.add(path);
+						}
+						return;
+					}
 
-				ensureTarget(path, targetPath, () -> {
-					if (hardlinkOnCopy) {
-						try {
-							Files.createLink(targetPath, path);
-							touch(targetPath);
-						} catch (UnsupportedOperationException | SecurityException | FileAlreadyExistsException e) {
-							// if couldn't, then just actually copy it
+					ensureTarget(path, targetPath, () -> {
+						if (hardlinkOnCopy) {
+							try {
+								Files.createLink(targetPath, path);
+								touch(targetPath);
+							} catch (UnsupportedOperationException | SecurityException | FileAlreadyExistsException e) {
+								// if couldn't, then just actually copy it
+								Files.copy(path, targetPath, REPLACE_EXISTING);
+							}
+						} else {
 							Files.copy(path, targetPath, REPLACE_EXISTING);
 						}
-					} else {
-						Files.copy(path, targetPath, REPLACE_EXISTING);
-					}
-					return null;
+						if (synced) {
+							toFSync.add(targetPath.getParent());
+						}
+						return null;
+					});
 				});
-			});
+			}
+		} finally {
+			for (Path path : toFSync) {
+				fsync(path);
+			}
 		}
 	}
 
-	private void doMove(Map<String, String> sourceToTargetMap) throws FsBatchException, FsIOException {
-		for (Map.Entry<String, String> entry : sourceToTargetMap.entrySet()) {
-			String from = entry.getKey();
-			String to = entry.getValue();
-			translateBatchErrors(from, to, () -> {
-				Path path = resolve(from);
-				if (!Files.isRegularFile(path)) {
-					throw new FileNotFoundException(LocalActiveFs.class, "File '" + from + "' not found");
-				}
-				Path targetPath = resolve(to);
-				if (path.equals(targetPath)) {
-					touch(path);
-					return;
-				}
-				doMove(path, targetPath);
-			});
+	private void doMove(Map<String, String> sourceToTargetMap) throws FsBatchException, FsIOException, IOException {
+		Set<Path> toFSync = new HashSet<>();
+		try {
+			for (Map.Entry<String, String> entry : sourceToTargetMap.entrySet()) {
+				String from = entry.getKey();
+				String to = entry.getValue();
+				translateBatchErrors(from, to, () -> {
+					Path path = resolve(from);
+					if (!Files.isRegularFile(path)) {
+						throw new FileNotFoundException(LocalActiveFs.class, "File '" + from + "' not found");
+					}
+					Path targetPath = resolve(to);
+					if (path.equals(targetPath)) {
+						touch(path);
+						if (synced) {
+							toFSync.add(path);
+						}
+						return;
+					}
+					doMove(path, targetPath);
+					if (synced) {
+						toFSync.add(targetPath.getParent());
+					}
+				});
+			}
+		} finally {
+			for (Path path : toFSync) {
+				fsync(path);
+			}
 		}
 	}
 
@@ -508,7 +594,7 @@ public final class LocalActiveFs implements ActiveFs, EventloopService, Eventloo
 				if (source != null && !Files.exists(source)) {
 					throw e;
 				}
-				Files.createDirectories(parent);
+				createDirectories(parent, storage);
 			} catch (FileSystemException e) {
 				if (source != null && !Files.isRegularFile(source)) {
 					throw new FileNotFoundException(LocalActiveFs.class);
@@ -760,6 +846,44 @@ public final class LocalActiveFs implements ActiveFs, EventloopService, Eventloo
 		} catch (PatternSyntaxException | UnsupportedOperationException e) {
 			logger.warn("Malformed glob", e);
 			throw new MalformedGlobException(LocalActiveFs.class);
+		}
+	}
+
+	private void createDirectories(Path path) throws IOException {
+		createDirectories(path, path.getRoot());
+	}
+
+	private void createDirectories(Path path, Path root) throws IOException {
+		Path parent = path;
+		while (!parent.equals(root)) {
+			if (Files.exists(parent)) break;
+			parent = parent.getParent();
+		}
+
+		Path child = parent;
+		for (Path name : parent.relativize(path)) {
+			Path newChild = child.resolve(name);
+			if (createDir(newChild) && synced) {
+				fsync(child);
+			}
+			child = newChild;
+		}
+	}
+
+	private static boolean createDir(Path path) throws IOException {
+		try {
+			Files.createDirectory(path);
+			return true;
+		} catch (FileAlreadyExistsException e) {
+			if (!Files.isDirectory(path))
+				throw e;
+		}
+		return false;
+	}
+
+	private static void fsync(Path path) throws IOException {
+		try (FileChannel channel = FileChannel.open(path)) {
+			channel.force(true);
 		}
 	}
 
